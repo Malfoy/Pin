@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-multiminimizers = { path = "external/multiminimizers" }
+multiminimizers = { git = "https://github.com/lrobidou/multiminimizers", rev = "5bf570ce8de15c8716603d8f609f73e8fbe1a167" }
 ahash = "0.8"
 parking_lot = "0.12"
 rayon = "1.10"

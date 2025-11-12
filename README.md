@@ -61,7 +61,9 @@ error that shows the offending sequence and k-mer offset.
   additional 1 Mb random-sequence lookup, printing how many k-mers hit the
   index alongside the query time for that synthetic workload.
 - `multiminimizers` (the SIMD minimizer implementation from
-  https://github.com/lrobidou/multiminimizers) is vendored under
-  `external/multiminimizers` and used directly as a path dependency.
-- Stored dictionary keys are raw (non-hashed) minimizer encodings, which keeps
-  membership tests exact while benefiting from `ahash` performance.
+  https://github.com/lrobidou/multiminimizers) is pulled directly as a git
+  dependency, so `cargo build`/`cargo run` automatically fetch the correct
+  revision.
+- Stored dictionary keys reuse the hashed minimizer identifiers emitted by
+  `multiminimizers`, matching its iterator API while keeping lookups fast with
+  `AHash`.

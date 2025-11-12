@@ -445,7 +445,7 @@ fn process_single_insert<const N: usize>(
                 continue;
             }
             stats.minimizers_emitted += 1;
-            if dictionary.insert(sk.get_minimizer_no_hashed()) {
+            if dictionary.insert(sk.get_minimizer_hashed()) {
                 stats.minimizers_new += 1;
             }
             covered[start..end_exclusive].fill(true);
@@ -540,7 +540,7 @@ fn mark_covered_kmers<const N: usize>(
             if sk.superkmer.len() < k {
                 continue;
             }
-            if dictionary.contains(sk.get_minimizer_no_hashed()) {
+            if dictionary.contains(sk.get_minimizer_hashed()) {
                 let start = sk.superkmer.start();
                 if start >= covered.len() {
                     continue;
