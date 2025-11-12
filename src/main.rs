@@ -5,28 +5,23 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ahash::AHashSet;
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use bincode::{deserialize_from, serialize_into};
 use clap::Parser;
-use flate2::read::MultiGzDecoder;
 use multiminimizers::{
     compute_all_superkmers_linear_streaming, compute_superkmers_linear_streaming,
 };
 use num_format::{Locale, ToFormattedString};
 use parking_lot::Mutex;
 use rand::Rng;
-use rayon::{ThreadPoolBuilder, prelude::*};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use zstd::stream::{read::Decoder as ZstdDecoder, write::Encoder as ZstdEncoder};
 
-mod ocm;
-
-use ocm::Config as OcmConfig;
-
 const CANONICAL: bool = true;
 const SUPPORTED_MAX_SEEDS: usize = 16;
-const PARALLEL_CHUNK_SIZE: usize = 256;
-const PARTITION_COUNT: usize = 10000;
+const PARALLEL_CHUNK_SIZE: usize = 128;
+const PARTITION_COUNT: usize = 1000;
 const SHARD_INITIAL_CAPACITY: usize = 256;
 const RANDOM_QUERY_LENGTH: usize = 1_000_000;
 const ZSTD_LEVEL: i32 = -1;
@@ -64,14 +59,6 @@ struct Args {
     /// Save the final index to disk after building.
     #[arg(long = "save-index", value_name = "FILE")]
     save_index: Option<PathBuf>,
-
-    /// Number of worker threads to use (defaults to logical CPU count).
-    #[arg(long = "threads", value_name = "THREADS")]
-    threads: Option<usize>,
-
-    /// Use Open-Close Mod minimizers instead of SIMD sticky minimizers.
-    #[arg(long = "OCM", alias = "ocm")]
-    ocm: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -275,13 +262,6 @@ fn main() -> Result<()> {
         args.build_fasta.is_some() || args.load_index.is_some(),
         "Provide --build to create an index, --load-index to reuse an existing one, or both."
     );
-
-    let default_threads = num_cpus::get();
-    let requested_threads = args.threads.unwrap_or(default_threads);
-    ThreadPoolBuilder::new()
-        .num_threads(requested_threads)
-        .build_global()
-        .map_err(|err| anyhow!("Failed to configure Rayon thread pool: {err}"))?;
     if let Some(path) = &args.build_fasta {
         ensure_path_exists(path, "build FASTA")?;
     }
@@ -320,16 +300,10 @@ fn run<const N: usize>(args: &Args) -> Result<()> {
         PartitionedMinimizerSet::default()
     };
     let dictionary = Arc::new(initial_dictionary);
-    let ocm_config = if args.ocm {
-        Some(Arc::new(OcmConfig::new(args.k, args.m, N)?))
-    } else {
-        None
-    };
 
     if let Some(build_path) = &args.build_fasta {
         let build_start = Instant::now();
-        let build_stats =
-            insert_sequences::<N>(build_path, args.k, args.m, &dictionary, ocm_config.clone())?;
+        let build_stats = insert_sequences::<N>(build_path, args.k, args.m, &dictionary)?;
         let build_duration = build_start.elapsed();
 
         println!(
@@ -348,13 +322,6 @@ fn run<const N: usize>(args: &Args) -> Result<()> {
             fmt_num(dictionary.as_ref().total_entries())
         );
         println!("Construction time: {build_duration:?}");
-        if args.ocm {
-            println!(
-                "OCM emitted {} minimizers ({} unique)",
-                fmt_num(build_stats.minimizers_emitted),
-                fmt_num(build_stats.minimizers_new)
-            );
-        }
     }
 
     if let Some(save_path) = &args.save_index {
@@ -368,8 +335,7 @@ fn run<const N: usize>(args: &Args) -> Result<()> {
 
     if let Some(query_path) = &args.query_fasta {
         let validation_start = Instant::now();
-        let validation_stats =
-            validate_sequences::<N>(query_path, args.k, args.m, &dictionary, ocm_config.clone())?;
+        let validation_stats = validate_sequences::<N>(query_path, args.k, args.m, &dictionary)?;
         let validation_duration = validation_start.elapsed();
         println!(
             "Validated {} sequences covering {} kmers: all accounted for.",
@@ -387,13 +353,8 @@ fn run<const N: usize>(args: &Args) -> Result<()> {
             0
         };
         let random_query_start = Instant::now();
-        let random_hits = count_kmers_in_dictionary::<N>(
-            &random_sequence,
-            args.k,
-            args.m,
-            dictionary.as_ref(),
-            ocm_config.as_deref(),
-        );
+        let random_hits =
+            count_kmers_in_dictionary::<N>(&random_sequence, args.k, args.m, dictionary.as_ref());
         let random_query_duration = random_query_start.elapsed();
         println!(
             "Random query ({} bp): {} / {} kmers hit in {:?}",
@@ -411,11 +372,10 @@ fn insert_sequences<const N: usize>(
     k: usize,
     m: usize,
     dictionary: &Arc<PartitionedMinimizerSet>,
-    ocm_config: Option<Arc<OcmConfig>>,
 ) -> Result<BuildStats> {
     let mut stats = BuildStats::default();
     stream_fasta_in_chunks(fasta, PARALLEL_CHUNK_SIZE, |chunk| {
-        let chunk_stats = process_insert_chunk::<N>(chunk, dictionary, k, m, ocm_config.clone());
+        let chunk_stats = process_insert_chunk::<N>(chunk, dictionary, k, m);
         stats.merge(chunk_stats);
         Ok(())
     })?;
@@ -427,13 +387,10 @@ fn process_insert_chunk<const N: usize>(
     dictionary: &Arc<PartitionedMinimizerSet>,
     k: usize,
     m: usize,
-    ocm_config: Option<Arc<OcmConfig>>,
 ) -> BuildStats {
     chunk
         .into_par_iter()
-        .map(|record| {
-            process_single_insert::<N>(&record.sequence, k, m, dictionary, ocm_config.as_deref())
-        })
+        .map(|record| process_single_insert::<N>(&record.sequence, k, m, dictionary))
         .reduce(BuildStats::default, |mut acc, item| {
             acc.merge(item);
             acc
@@ -445,13 +402,11 @@ fn process_single_insert<const N: usize>(
     k: usize,
     m: usize,
     dictionary: &PartitionedMinimizerSet,
-    ocm_config: Option<&OcmConfig>,
 ) -> BuildStats {
     if sequence.len() < k {
-        return BuildStats {
-            sequences_skipped: 1,
-            ..BuildStats::default()
-        };
+        let mut stats = BuildStats::default();
+        stats.sequences_skipped = 1;
+        return stats;
     }
 
     let mut stats = BuildStats {
@@ -463,62 +418,13 @@ fn process_single_insert<const N: usize>(
     };
 
     let mut covered = vec![false; sequence.len() - k + 1];
-    let mut cached_ocm_selections = None;
-    if let Some(cfg) = ocm_config {
-        let selections =
-            ocm::compute_selections(sequence, cfg).expect("OCM minimizer selection failed");
-        #[cfg(debug_assertions)]
-        {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static SEQ_COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let idx = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed);
-            if idx < 1 {
-                eprintln!(
-                    "OCM seq {} len {} selections {}",
-                    idx,
-                    sequence.len(),
-                    selections.len()
-                );
-            }
-        }
-        ocm::apply_dictionary_hits(sequence, cfg, dictionary, &mut covered, &selections);
-        cached_ocm_selections = Some(selections);
-    } else {
-        mark_covered_kmers::<N>(sequence, k, m, dictionary, &mut covered, None);
-    }
+    mark_covered_kmers::<N>(sequence, k, m, dictionary, &mut covered);
 
     if covered.iter().all(|&hit| hit) {
         return stats;
     }
 
-    if let Some(cfg) = ocm_config {
-        let selections = cached_ocm_selections.unwrap_or_else(|| {
-            ocm::compute_selections(sequence, cfg).expect("OCM minimizer selection failed")
-        });
-        for sel in selections {
-            let (start, end) = match ocm::selection_kmer_range(&sel, covered.len()) {
-                Some(range) => range,
-                None => continue,
-            };
-            if start >= end {
-                continue;
-            }
-            if covered[start..end].iter().all(|&hit| hit) {
-                continue;
-            }
-            let min_start = sel.minimizer_pos;
-            let min_end = min_start + cfg.minimizer_len();
-            if min_end > sequence.len() {
-                continue;
-            }
-            stats.minimizers_emitted += 1;
-            let encoded = ocm::encode_minimizer(&sequence[min_start..min_end]);
-            if dictionary.insert(encoded) {
-                stats.minimizers_new += 1;
-            }
-            covered[start..end].fill(true);
-        }
-    } else if let Some(iter) = compute_superkmers_linear_streaming::<N, CANONICAL>(sequence, k, m) {
+    if let Some(iter) = compute_superkmers_linear_streaming::<N, CANONICAL>(sequence, k, m) {
         for sk in iter {
             if sk.superkmer.len() < k {
                 continue;
@@ -562,12 +468,10 @@ fn validate_sequences<const N: usize>(
     k: usize,
     m: usize,
     dictionary: &Arc<PartitionedMinimizerSet>,
-    ocm_config: Option<Arc<OcmConfig>>,
 ) -> Result<ValidationStats> {
     let mut stats = ValidationStats::default();
     stream_fasta_in_chunks(fasta, PARALLEL_CHUNK_SIZE, |chunk| {
-        let chunk_stats =
-            process_validation_chunk::<N>(chunk, dictionary, k, m, ocm_config.clone())?;
+        let chunk_stats = process_validation_chunk::<N>(chunk, dictionary, k, m)?;
         stats.merge(chunk_stats);
         Ok(())
     })?;
@@ -579,19 +483,12 @@ fn process_validation_chunk<const N: usize>(
     dictionary: &Arc<PartitionedMinimizerSet>,
     k: usize,
     m: usize,
-    ocm_config: Option<Arc<OcmConfig>>,
 ) -> Result<ValidationStats> {
     chunk
         .into_par_iter()
         .try_fold(ValidationStats::default, |mut acc, record| {
-            let seq_stats = process_single_validation::<N>(
-                &record.header,
-                &record.sequence,
-                k,
-                m,
-                dictionary,
-                ocm_config.as_deref(),
-            )?;
+            let seq_stats =
+                process_single_validation::<N>(&record.header, &record.sequence, k, m, dictionary)?;
             acc.merge(seq_stats);
             Ok(acc)
         })
@@ -607,7 +504,6 @@ fn process_single_validation<const N: usize>(
     k: usize,
     m: usize,
     dictionary: &PartitionedMinimizerSet,
-    ocm_config: Option<&OcmConfig>,
 ) -> Result<ValidationStats> {
     if sequence.len() < k {
         return Ok(ValidationStats::default());
@@ -619,7 +515,7 @@ fn process_single_validation<const N: usize>(
     };
 
     let mut covered = vec![false; sequence.len() - k + 1];
-    mark_covered_kmers::<N>(sequence, k, m, dictionary, &mut covered, ocm_config);
+    mark_covered_kmers::<N>(sequence, k, m, dictionary, &mut covered);
 
     if let Some((idx, _)) = covered.iter().enumerate().find(|(_, hit)| !**hit) {
         bail!(
@@ -638,14 +534,7 @@ fn mark_covered_kmers<const N: usize>(
     m: usize,
     dictionary: &PartitionedMinimizerSet,
     covered: &mut [bool],
-    ocm_config: Option<&OcmConfig>,
 ) {
-    if let Some(cfg) = ocm_config {
-        let selections =
-            ocm::compute_selections(sequence, cfg).expect("OCM minimizer selection failed");
-        ocm::apply_dictionary_hits(sequence, cfg, dictionary, covered, &selections);
-        return;
-    }
     if let Some(iter) = compute_all_superkmers_linear_streaming::<N, CANONICAL>(sequence, k, m) {
         for sk in iter {
             if sk.superkmer.len() < k {
@@ -695,7 +584,8 @@ fn stream_fasta_records<F>(path: &Path, mut on_record: F) -> Result<()>
 where
     F: FnMut(String, Vec<u8>) -> Result<()>,
 {
-    let mut reader = open_sequence_reader(path)?;
+    let file = File::open(path).with_context(|| format!("Failed to open FASTA file {:?}", path))?;
+    let mut reader = BufReader::new(file);
     let mut header: Option<String> = None;
     let mut sequence: Vec<u8> = Vec::new();
     let mut line = String::new();
@@ -708,16 +598,16 @@ where
             break;
         }
         line_number += 1;
-        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
         if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix('>') {
+        if trimmed.starts_with('>') {
             if let Some(prev_header) = header.take() {
                 let seq = std::mem::take(&mut sequence);
                 on_record(prev_header, seq)?;
             }
-            header = Some(rest.trim().to_owned());
+            header = Some(trimmed[1..].trim().to_owned());
             continue;
         }
 
@@ -742,40 +632,17 @@ fn ensure_path_exists(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn open_sequence_reader(path: &Path) -> Result<Box<dyn BufRead>> {
-    let file = File::open(path).with_context(|| format!("Failed to open FASTA file {:?}", path))?;
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    let reader: Box<dyn BufRead> = match ext.as_str() {
-        "gz" | "gzip" => {
-            let decoder = MultiGzDecoder::new(file);
-            Box::new(BufReader::new(decoder))
-        }
-        "zst" | "zstd" => {
-            let decoder = ZstdDecoder::new(file)
-                .with_context(|| format!("Failed to decode zstd file {:?}", path))?;
-            Box::new(BufReader::new(decoder))
-        }
-        _ => Box::new(BufReader::new(file)),
-    };
-    Ok(reader)
-}
-
 fn count_kmers_in_dictionary<const N: usize>(
     sequence: &[u8],
     k: usize,
     m: usize,
     dictionary: &PartitionedMinimizerSet,
-    ocm_config: Option<&OcmConfig>,
 ) -> u64 {
     if sequence.len() < k {
         return 0;
     }
     let mut covered = vec![false; sequence.len() - k + 1];
-    mark_covered_kmers::<N>(sequence, k, m, dictionary, &mut covered, ocm_config);
+    mark_covered_kmers::<N>(sequence, k, m, dictionary, &mut covered);
     covered.into_iter().filter(|hit| *hit).count() as u64
 }
 

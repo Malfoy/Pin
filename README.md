@@ -12,7 +12,6 @@ cargo run --release -- \
     --kmer 31 \
     --minimizer 17 \
     --seeds 4 \
-    --threads 32 \
     --build training.fa \
     --query validation.fa \
     --save-index k31_m17.idx
@@ -22,7 +21,6 @@ cargo run --release -- \
     --kmer 31 \
     --minimizer 17 \
     --seeds 4 \
-    --threads 16 \
     --load-index k31_m17.idx \
     --query validation.fa
 ```
@@ -31,13 +29,7 @@ cargo run --release -- \
 - `--minimizer/-m`: length of minimizers (`M`) used during indexing.
 - `--seeds/-n`: number of hash seeds (SIMD lanes) to use. The current binary
   supports values from 1 to 16.
-- `--threads`: optional override for the number of Rayon worker threads
-  (defaults to the number of logical CPUs).
-- `--OCM`: switch from SIMD sticky minimizers to the Open-Close mod-minimizer
-  scheme while keeping the rest of the workflow identical.
 - The final positional argument is the FASTA file to index.
-- FASTA files may be plain text, `.gz`, or `.zst`; compression is detected from
-  the extension automatically.
 
 Constraints:
 
@@ -69,7 +61,7 @@ error that shows the offending sequence and k-mer offset.
   additional 1 Mb random-sequence lookup, printing how many k-mers hit the
   index alongside the query time for that synthetic workload.
 - `multiminimizers` (the SIMD minimizer implementation from
-  https://github.com/lrobidou/multiminimizers) is pulled directly as a git
-  dependency, so a plain `cargo build`/`cargo run` will fetch it automatically.
+  https://github.com/lrobidou/multiminimizers) is vendored under
+  `external/multiminimizers` and used directly as a path dependency.
 - Stored dictionary keys are raw (non-hashed) minimizer encodings, which keeps
   membership tests exact while benefiting from `ahash` performance.
