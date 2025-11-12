@@ -54,8 +54,9 @@ error that shows the offending sequence and k-mer offset.
   iterator is only invoked to index the remaining uncovered kmers, so no new
   entries are inserted unless they are strictly needed.
 - Serialized indexes store the full sharded hash-set plus `K`, `M`, and seed
-  metadata in a compact `bincode` blob, enabling `--load-index`/`--save-index`
-  workflows without rebuilding from FASTA.
+  metadata in a `bincode` blob compressed with `zstd -1`, enabling
+  `--load-index`/`--save-index` workflows without rebuilding from FASTA while
+  keeping files small.
 - The CLI reports construction time, query/validation time, and also runs an
   additional 1 Mb random-sequence lookup, printing how many k-mers hit the
   index alongside the query time for that synthetic workload.

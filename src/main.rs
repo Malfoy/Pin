@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use zstd::stream::{read::Decoder as ZstdDecoder, write::Encoder as ZstdEncoder};
 
 const CANONICAL: bool = true;
 const SUPPORTED_MAX_SEEDS: usize = 16;
@@ -23,6 +24,7 @@ const PARALLEL_CHUNK_SIZE: usize = 128;
 const PARTITION_COUNT: usize = 1000;
 const SHARD_INITIAL_CAPACITY: usize = 256;
 const RANDOM_QUERY_LENGTH: usize = 1_000_000;
+const ZSTD_LEVEL: i32 = -1;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -181,12 +183,18 @@ fn save_index_to_file(
 
     let file = File::create(path)
         .with_context(|| format!("Failed to create index file '{}'", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    serialize_into(&mut writer, &serialized)
-        .with_context(|| format!("Failed to serialize index to '{}'", path.display()))?;
-    writer
-        .flush()
-        .with_context(|| format!("Failed to flush index file '{}'", path.display()))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = ZstdEncoder::new(writer, ZSTD_LEVEL)
+        .with_context(|| format!("Failed to initialize zstd encoder for '{}'", path.display()))?;
+    serialize_into(&mut encoder, &serialized).with_context(|| {
+        format!(
+            "Failed to serialize compressed index to '{}'",
+            path.display()
+        )
+    })?;
+    encoder
+        .finish()
+        .with_context(|| format!("Failed to finalize index file '{}'", path.display()))?;
     Ok(())
 }
 
@@ -198,8 +206,10 @@ fn load_index_from_file(
 ) -> Result<PartitionedMinimizerSet> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open index file '{}'", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let snapshot: SerializedIndex = deserialize_from(&mut reader)
+    let reader = BufReader::new(file);
+    let mut decoder = ZstdDecoder::new(reader)
+        .with_context(|| format!("Failed to initialize zstd decoder for '{}'", path.display()))?;
+    let snapshot: SerializedIndex = deserialize_from(&mut decoder)
         .with_context(|| format!("Failed to deserialize index from '{}'", path.display()))?;
 
     ensure!(
